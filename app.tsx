@@ -1,0 +1,263 @@
+import React, { useState, useEffect, useRef } from "react";
+import { render, Box, Text, useStdout, useStdin } from "ink";
+import pty from "node-pty";
+import xterm from "@xterm/headless";
+const { Terminal: XTerminal } = xterm;
+
+// ── Color conversion ────────────────────────────────────
+// xterm buffer cells store colors as mode + value.
+// We convert them to hex strings that Ink's <Text> understands.
+
+const ANSI_COLORS = [
+  "#000000", "#cc0000", "#4e9a06", "#c4a000",
+  "#3465a4", "#75507b", "#06989a", "#d3d7cf",
+  "#555753", "#ef2929", "#8ae234", "#fce94f",
+  "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec",
+];
+
+function palette256(idx: number): string {
+  if (idx < 16) return ANSI_COLORS[idx];
+  if (idx < 232) {
+    const i = idx - 16;
+    const r = Math.floor(i / 36);
+    const g = Math.floor(i / 6) % 6;
+    const b = i % 6;
+    const v = (n: number) => (n === 0 ? 0 : 55 + 40 * n);
+    return "#" + [r, g, b].map((n) => v(n).toString(16).padStart(2, "0")).join("");
+  }
+  const v = 8 + 10 * (idx - 232);
+  const h = v.toString(16).padStart(2, "0");
+  return `#${h}${h}${h}`;
+}
+
+interface ColorCell {
+  isFgPalette(): boolean;
+  isFgRGB(): boolean;
+  isFgDefault(): boolean;
+  getFgColor(): number;
+  isBgPalette(): boolean;
+  isBgRGB(): boolean;
+  isBgDefault(): boolean;
+  getBgColor(): number;
+}
+
+function fgColor(cell: ColorCell): string | undefined {
+  if (cell.isFgDefault()) return undefined;
+  if (cell.isFgPalette()) return palette256(cell.getFgColor());
+  if (cell.isFgRGB()) {
+    const c = cell.getFgColor();
+    return "#" + ((c >> 16) & 0xff).toString(16).padStart(2, "0")
+      + ((c >> 8) & 0xff).toString(16).padStart(2, "0")
+      + (c & 0xff).toString(16).padStart(2, "0");
+  }
+  return undefined;
+}
+
+function bgColor(cell: ColorCell): string | undefined {
+  if (cell.isBgDefault()) return undefined;
+  if (cell.isBgPalette()) return palette256(cell.getBgColor());
+  if (cell.isBgRGB()) {
+    const c = cell.getBgColor();
+    return "#" + ((c >> 16) & 0xff).toString(16).padStart(2, "0")
+      + ((c >> 8) & 0xff).toString(16).padStart(2, "0")
+      + (c & 0xff).toString(16).padStart(2, "0");
+  }
+  return undefined;
+}
+
+// ── Span types ──────────────────────────────────────────
+// We group consecutive cells with identical attributes into spans,
+// so one <Text> per style run instead of one per character.
+
+interface Span {
+  text: string;
+  fg?: string;
+  bg?: string;
+  bold: boolean;
+  dim: boolean;
+  italic: boolean;
+  underline: boolean;
+  strikethrough: boolean;
+}
+
+type Line = Span[];
+
+function readBuffer(term: InstanceType<typeof XTerminal>, rows: number, cols: number): Line[] {
+  const buf = term.buffer.active;
+  const lines: Line[] = [];
+
+  for (let y = 0; y < rows; y++) {
+    const bufLine = buf.getLine(y);
+    if (!bufLine) {
+      lines.push([{ text: " ", bold: false, dim: false, italic: false, underline: false, strikethrough: false }]);
+      continue;
+    }
+
+    const spans: Span[] = [];
+    let cur: Span | null = null;
+
+    for (let x = 0; x < cols; x++) {
+      const cell = bufLine.getCell(x);
+      if (!cell || cell.getWidth() === 0) continue;
+
+      const chars = cell.getChars() || " ";
+      const inverse = cell.isInverse() !== 0;
+      const rawFg = fgColor(cell);
+      const rawBg = bgColor(cell);
+      const fg = inverse ? rawBg : rawFg;
+      const bg = inverse ? rawFg : rawBg;
+      const bold = cell.isBold() !== 0;
+      const dim = cell.isDim() !== 0;
+      const italic = cell.isItalic() !== 0;
+      const underline = cell.isUnderline() !== 0;
+      const strikethrough = cell.isStrikethrough() !== 0;
+
+      if (
+        cur &&
+        cur.fg === fg && cur.bg === bg &&
+        cur.bold === bold && cur.dim === dim &&
+        cur.italic === italic && cur.underline === underline &&
+        cur.strikethrough === strikethrough
+      ) {
+        cur.text += chars;
+      } else {
+        cur = { text: chars, fg, bg, bold, dim, italic, underline, strikethrough };
+        spans.push(cur);
+      }
+    }
+
+    if (spans.length === 0) {
+      spans.push({ text: " ", bold: false, dim: false, italic: false, underline: false, strikethrough: false });
+    }
+    lines.push(spans);
+  }
+
+  return lines;
+}
+
+// ── Components ──────────────────────────────────────────
+
+function Clock() {
+  const [now, setNow] = useState(new Date());
+
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  const time = now.toLocaleTimeString("en-GB", { hour12: false });
+  const date = now.toLocaleDateString("en-GB", {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+  });
+
+  return (
+    <Text>
+      <Text color="cyan" bold>{time}</Text>
+      <Text dimColor> {date}</Text>
+    </Text>
+  );
+}
+
+function TerminalLine({ spans }: { spans: Span[] }) {
+  return (
+    <Text wrap="truncate">
+      {spans.map((s, i) => (
+        <Text
+          key={i}
+          color={s.fg}
+          backgroundColor={s.bg}
+          bold={s.bold}
+          dimColor={s.dim}
+          italic={s.italic}
+          underline={s.underline}
+          strikethrough={s.strikethrough}
+        >
+          {s.text}
+        </Text>
+      ))}
+    </Text>
+  );
+}
+
+function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
+  const { stdin, setRawMode } = useStdin();
+  const [lines, setLines] = useState<Line[]>(() =>
+    Array.from({ length: rows }, () => [
+      { text: " ", bold: false, dim: false, italic: false, underline: false, strikethrough: false },
+    ])
+  );
+  const needsRefresh = useRef(false);
+
+  useEffect(() => {
+    setRawMode(true);
+
+    const term = new XTerminal({ rows, cols, allowProposedApi: true });
+
+    const shell = pty.spawn(process.env.SHELL || "bash", [], {
+      name: "xterm-256color",
+      cols,
+      rows,
+      cwd: process.cwd(),
+      env: process.env as Record<string, string>,
+    });
+
+    shell.onData((data: string) => {
+      term.write(data);
+      needsRefresh.current = true;
+    });
+
+    const refreshId = setInterval(() => {
+      if (needsRefresh.current) {
+        needsRefresh.current = false;
+        setLines(readBuffer(term, rows, cols));
+      }
+    }, 16);
+
+    const handleInput = (data: Buffer) => {
+      shell.write(data.toString());
+    };
+    stdin?.on("data", handleInput);
+
+    shell.onExit(() => {
+      clearInterval(refreshId);
+      process.exit(0);
+    });
+
+    return () => {
+      clearInterval(refreshId);
+      stdin?.off("data", handleInput);
+      shell.kill();
+      term.dispose();
+    };
+  }, []);
+
+  return (
+    <Box flexDirection="column" flexGrow={1}>
+      {lines.map((spans, i) => (
+        <TerminalLine key={i} spans={spans} />
+      ))}
+    </Box>
+  );
+}
+
+function InkBox() {
+  const { stdout } = useStdout();
+  const cols = stdout?.columns || 80;
+  const totalRows = stdout?.rows || 24;
+  const termRows = totalRows - 1;
+
+  return (
+    <Box flexDirection="column" width={cols} height={totalRows}>
+      <Box paddingX={1}>
+        <Text bold color="green">InkBox</Text>
+        <Box flexGrow={1} />
+        <Clock />
+      </Box>
+      <TerminalEmulator rows={termRows} cols={cols} />
+    </Box>
+  );
+}
+
+render(<InkBox />, { exitOnCtrlC: false });
