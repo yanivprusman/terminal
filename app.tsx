@@ -82,12 +82,37 @@ interface Span {
 
 type Line = Span[];
 
-function readBuffer(term: InstanceType<typeof XTerminal>, rows: number, cols: number): Line[] {
+interface Selection {
+  startRow: number;
+  startCol: number;
+  endRow: number;
+  endCol: number;
+}
+
+function normalizeSelection(sel: Selection): Selection {
+  if (sel.startRow < sel.endRow || (sel.startRow === sel.endRow && sel.startCol <= sel.endCol))
+    return sel;
+  return { startRow: sel.endRow, startCol: sel.endCol, endRow: sel.startRow, endCol: sel.startCol };
+}
+
+function isCellSelected(row: number, col: number, sel: Selection): boolean {
+  const n = normalizeSelection(sel);
+  if (row < n.startRow || row > n.endRow) return false;
+  if (row === n.startRow && row === n.endRow) return col >= n.startCol && col <= n.endCol;
+  if (row === n.startRow) return col >= n.startCol;
+  if (row === n.endRow) return col <= n.endCol;
+  return true;
+}
+
+function readBuffer(term: InstanceType<typeof XTerminal>, rows: number, cols: number, selection?: Selection | null): Line[] {
   const buf = term.buffer.active;
   const lines: Line[] = [];
+  const startY = buf.viewportY;
+  const cursorRow = buf.cursorY + buf.baseY - startY;
+  const cursorCol = buf.cursorX;
 
   for (let y = 0; y < rows; y++) {
-    const bufLine = buf.getLine(y);
+    const bufLine = buf.getLine(startY + y);
     if (!bufLine) {
       lines.push([{ text: " ", bold: false, dim: false, italic: false, underline: false, strikethrough: false }]);
       continue;
@@ -104,8 +129,18 @@ function readBuffer(term: InstanceType<typeof XTerminal>, rows: number, cols: nu
       const inverse = cell.isInverse() !== 0;
       const rawFg = fgColor(cell);
       const rawBg = bgColor(cell);
-      const fg = inverse ? rawBg : rawFg;
-      const bg = inverse ? rawFg : rawBg;
+      let fg = inverse ? rawBg : rawFg;
+      let bg = inverse ? rawFg : rawBg;
+
+      if (y === cursorRow && x === cursorCol) {
+        const t = fg;
+        fg = bg || "#000000";
+        bg = t || "#d3d7cf";
+      }
+      if (selection && isCellSelected(y, x, selection)) {
+        fg = "#ffffff";
+        bg = "#3465a4";
+      }
       const bold = cell.isBold() !== 0;
       const dim = cell.isDim() !== 0;
       const italic = cell.isItalic() !== 0;
@@ -189,6 +224,7 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
     ])
   );
   const needsRefresh = useRef(false);
+  const selection = useRef<Selection | null>(null);
 
   useEffect(() => {
     setRawMode(true);
@@ -211,22 +247,158 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
     const refreshId = setInterval(() => {
       if (needsRefresh.current) {
         needsRefresh.current = false;
-        setLines(readBuffer(term, rows, cols));
+        setLines(readBuffer(term, rows, cols, selection.current));
       }
     }, 16);
 
+    process.stdout.write('\x1b[?1002h\x1b[?1006h');
+
+    let inBuf = '';
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const flushBuf = () => {
+      if (inBuf) {
+        shell.write(inBuf);
+        inBuf = '';
+      }
+    };
+
+    const processInput = () => {
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+      let pos = 0;
+      while (pos < inBuf.length) {
+        if (inBuf[pos] === '\x1b') {
+          const rest = inBuf.slice(pos);
+
+          if (rest.startsWith('\x1b[5;2~')) {
+            term.scrollPages(-1);
+            needsRefresh.current = true;
+            pos += 6; continue;
+          }
+          if (rest.startsWith('\x1b[6;2~')) {
+            term.scrollPages(1);
+            needsRefresh.current = true;
+            pos += 6; continue;
+          }
+
+          const sgrMatch = rest.match(/^\x1b\[<(\d+);(\d+);(\d+)([Mm])/);
+          if (sgrMatch) {
+            const button = parseInt(sgrMatch[1]);
+            const mCol = parseInt(sgrMatch[2]) - 1;
+            const mRow = parseInt(sgrMatch[3]) - 2;
+            const isPress = sgrMatch[4] === 'M';
+
+            if (button === 64) { term.scrollLines(-3); needsRefresh.current = true; }
+            else if (button === 65) { term.scrollLines(3); needsRefresh.current = true; }
+            else if (term.modes.mouseTrackingMode !== 'none') {
+              shell.write(sgrMatch[0]);
+            }
+            else if (button === 0 && isPress) {
+              const r = Math.max(0, Math.min(mRow, rows - 1));
+              const c = Math.max(0, Math.min(mCol, cols - 1));
+              selection.current = { startRow: r, startCol: c, endRow: r, endCol: c };
+              needsRefresh.current = true;
+            }
+            else if (button === 32 && isPress && selection.current) {
+              selection.current.endRow = Math.max(0, Math.min(mRow, rows - 1));
+              selection.current.endCol = Math.max(0, Math.min(mCol, cols - 1));
+              needsRefresh.current = true;
+            }
+            else if (button === 0 && !isPress && selection.current) {
+              const sel = normalizeSelection(selection.current);
+              if (sel.startRow === sel.endRow && sel.startCol === sel.endCol) {
+                selection.current = null;
+                needsRefresh.current = true;
+              }
+            }
+            pos += sgrMatch[0].length; continue;
+          }
+
+          let complete = false;
+          if (rest.length === 1) {
+            // just \x1b — could be incomplete
+          } else if (rest[1] !== '[') {
+            complete = true; // \x1bX — two-char escape
+          } else {
+            for (let i = 2; i < rest.length; i++) {
+              const c = rest.charCodeAt(i);
+              if (c >= 0x40 && c <= 0x7e) { complete = true; break; }
+            }
+          }
+
+          if (!complete) {
+            inBuf = rest;
+            flushTimer = setTimeout(flushBuf, 50);
+            return;
+          }
+
+          const escMatch = rest.match(/^\x1b(\[[\x20-\x3f]*[\x40-\x7e]|[^\[])/);
+          if (escMatch) {
+            shell.write(escMatch[0]);
+            pos += escMatch[0].length; continue;
+          }
+          shell.write(inBuf[pos]);
+          pos++; continue;
+        }
+
+        if (inBuf[pos] === '\x03' && selection.current) {
+          const sel = normalizeSelection(selection.current);
+          if (!(sel.startRow === sel.endRow && sel.startCol === sel.endCol)) {
+            const buf = term.buffer.active;
+            const textLines: string[] = [];
+            for (let y = sel.startRow; y <= sel.endRow; y++) {
+              const line = buf.getLine(buf.viewportY + y);
+              if (!line) { textLines.push(''); continue; }
+              const sx = y === sel.startRow ? sel.startCol : 0;
+              const ex = y === sel.endRow ? sel.endCol : cols - 1;
+              let t = '';
+              for (let x = sx; x <= ex; x++) {
+                const cell = line.getCell(x);
+                t += cell ? (cell.getChars() || ' ') : ' ';
+              }
+              textLines.push(t.trimEnd());
+            }
+            const text = textLines.join('\n');
+            if (text.trim()) {
+              const b64 = Buffer.from(text).toString('base64');
+              process.stdout.write(`\x1b]52;c;${b64}\x07`);
+            }
+          }
+          selection.current = null;
+          needsRefresh.current = true;
+          pos++; continue;
+        }
+
+        let end = pos + 1;
+        while (end < inBuf.length && inBuf[end] !== '\x1b') end++;
+
+        if (term.buffer.active.viewportY !== term.buffer.active.baseY) {
+          term.scrollToBottom();
+          needsRefresh.current = true;
+        }
+        if (selection.current) { selection.current = null; needsRefresh.current = true; }
+        shell.write(inBuf.slice(pos, end));
+        pos = end;
+      }
+      inBuf = '';
+    };
+
     const handleInput = (data: Buffer) => {
-      shell.write(data.toString());
+      inBuf += data.toString();
+      processInput();
     };
     stdin?.on("data", handleInput);
 
     shell.onExit(() => {
+      process.stdout.write('\x1b[?1002l\x1b[?1006l');
       clearInterval(refreshId);
       process.exit(0);
     });
 
     return () => {
+      process.stdout.write('\x1b[?1002l\x1b[?1006l');
       clearInterval(refreshId);
+      if (flushTimer) clearTimeout(flushTimer);
       stdin?.off("data", handleInput);
       shell.kill();
       term.dispose();
