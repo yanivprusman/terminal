@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { render, Box, Text, useStdout, useStdin } from "ink";
+import { spawn } from "child_process";
 import pty from "node-pty";
 import xterm from "@xterm/headless";
 const { Terminal: XTerminal } = xterm;
@@ -360,8 +361,8 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
             }
             const text = textLines.join('\n');
             if (text.trim()) {
-              const b64 = Buffer.from(text).toString('base64');
-              process.stdout.write(`\x1b]52;c;${b64}\x07`);
+              const clip = spawn("xclip", ["-selection", "clipboard"], { stdio: ["pipe", "ignore", "ignore"] });
+              clip.stdin.end(text);
             }
           }
           selection.current = null;
