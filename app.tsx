@@ -415,22 +415,18 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
   );
 }
 
-function InkBox() {
+function AutomateLinuxTerminal() {
   const { stdout } = useStdout();
   const cols = stdout?.columns || 80;
   const totalRows = stdout?.rows || 24;
-  const termRows = totalRows - 1;
-
   return (
-    <Box flexDirection="column" width={cols} height={totalRows}>
-      <Box paddingX={1}>
-        <Text bold color="green">InkBox</Text>
-        <Box flexGrow={1} />
+    <Box width={cols} height={totalRows}>
+      <TerminalEmulator rows={totalRows} cols={cols} />
+      <Box position="absolute" marginLeft={cols - 22} paddingRight={1}>
         <Clock />
       </Box>
-      <TerminalEmulator rows={termRows} cols={cols} />
     </Box>
   );
 }
 
-render(<InkBox />, { exitOnCtrlC: false });
+render(<AutomateLinuxTerminal />, { exitOnCtrlC: false });

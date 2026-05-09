@@ -1,6 +1,6 @@
-# InkBox
+# automateLinuxTerminal
 
-A terminal emulator built with Ink. The Ink app **is** the terminal — it embeds a real shell inside an Ink layout, so widgets (clock, status, etc.) live alongside the terminal as React components.
+A terminal emulator built with Ink. The app embeds a real shell inside an Ink layout, so widgets (clock, status, etc.) live alongside the terminal as React components.
 
 ## Rules
 
