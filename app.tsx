@@ -237,7 +237,7 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
       cols,
       rows,
       cwd: process.cwd(),
-      env: process.env as Record<string, string>,
+      env: { ...process.env, AUTOMATE_LINUX_TERMINAL: "1" } as Record<string, string>,
     });
 
     shell.onData((data: string) => {
