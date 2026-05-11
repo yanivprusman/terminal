@@ -105,7 +105,7 @@ function isCellSelected(row: number, col: number, sel: Selection): boolean {
   return true;
 }
 
-function readBuffer(term: InstanceType<typeof XTerminal>, rows: number, cols: number, selection?: Selection | null): Line[] {
+function readBuffer(term: InstanceType<typeof XTerminal>, rows: number, cols: number, selection?: Selection | null, cursorVisible = true): Line[] {
   const buf = term.buffer.active;
   const lines: Line[] = [];
   const startY = buf.viewportY;
@@ -133,7 +133,7 @@ function readBuffer(term: InstanceType<typeof XTerminal>, rows: number, cols: nu
       let fg = inverse ? rawBg : rawFg;
       let bg = inverse ? rawFg : rawBg;
 
-      if (y === cursorRow && x === cursorCol) {
+      if (cursorVisible && y === cursorRow && x === cursorCol) {
         const t = fg;
         fg = bg || "#000000";
         bg = t || "#d3d7cf";
@@ -226,29 +226,61 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
   );
   const needsRefresh = useRef(false);
   const selection = useRef<Selection | null>(null);
+  const termRef = useRef<InstanceType<typeof XTerminal> | null>(null);
+  const shellRef = useRef<pty.IPty | null>(null);
+  const dimsRef = useRef({ rows, cols });
+  const cursorVisible = useRef(true);
+  const lastCursorPos = useRef({ row: -1, col: -1 });
+
+  useEffect(() => {
+    if (dimsRef.current.rows === rows && dimsRef.current.cols === cols && termRef.current) return;
+    dimsRef.current = { rows, cols };
+    if (termRef.current && shellRef.current) {
+      termRef.current.resize(cols, rows);
+      shellRef.current.resize(cols, rows);
+      needsRefresh.current = true;
+    }
+  }, [rows, cols]);
 
   useEffect(() => {
     setRawMode(true);
 
     const term = new XTerminal({ rows, cols, allowProposedApi: true });
+    termRef.current = term;
 
-    const shell = pty.spawn(process.env.SHELL || "bash", [], {
+    const shellPath = process.env.SHELL || "bash";
+    const shell = pty.spawn(shellPath, ["--login"], {
       name: "xterm-256color",
       cols,
       rows,
       cwd: process.cwd(),
       env: { ...process.env, AUTOMATE_LINUX_TERMINAL: "1" } as Record<string, string>,
     });
+    shellRef.current = shell;
 
     shell.onData((data: string) => {
-      term.write(data);
-      needsRefresh.current = true;
+      term.write(data, () => {
+        needsRefresh.current = true;
+      });
     });
+
+    const blinkId = setInterval(() => {
+      cursorVisible.current = !cursorVisible.current;
+      needsRefresh.current = true;
+    }, 530);
 
     const refreshId = setInterval(() => {
       if (needsRefresh.current) {
         needsRefresh.current = false;
-        setLines(readBuffer(term, rows, cols, selection.current));
+        const d = dimsRef.current;
+        const buf = term.buffer.active;
+        const curRow = buf.cursorY + buf.baseY - buf.viewportY;
+        const curCol = buf.cursorX;
+        if (curRow !== lastCursorPos.current.row || curCol !== lastCursorPos.current.col) {
+          lastCursorPos.current = { row: curRow, col: curCol };
+          cursorVisible.current = true;
+        }
+        setLines(readBuffer(term, d.rows, d.cols, selection.current, cursorVisible.current));
       }
     }, 16);
 
@@ -286,7 +318,7 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
           if (sgrMatch) {
             const button = parseInt(sgrMatch[1]);
             const mCol = parseInt(sgrMatch[2]) - 1;
-            const mRow = parseInt(sgrMatch[3]) - 2;
+            const mRow = parseInt(sgrMatch[3]) - 1;
             const isPress = sgrMatch[4] === 'M';
 
             if (button === 64) { term.scrollLines(-3); needsRefresh.current = true; }
@@ -295,14 +327,16 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
               shell.write(sgrMatch[0]);
             }
             else if (button === 0 && isPress) {
-              const r = Math.max(0, Math.min(mRow, rows - 1));
-              const c = Math.max(0, Math.min(mCol, cols - 1));
+              const d = dimsRef.current;
+              const r = Math.max(0, Math.min(mRow, d.rows - 1));
+              const c = Math.max(0, Math.min(mCol, d.cols - 1));
               selection.current = { startRow: r, startCol: c, endRow: r, endCol: c };
               needsRefresh.current = true;
             }
             else if (button === 32 && isPress && selection.current) {
-              selection.current.endRow = Math.max(0, Math.min(mRow, rows - 1));
-              selection.current.endCol = Math.max(0, Math.min(mCol, cols - 1));
+              const d = dimsRef.current;
+              selection.current.endRow = Math.max(0, Math.min(mRow, d.rows - 1));
+              selection.current.endCol = Math.max(0, Math.min(mCol, d.cols - 1));
               needsRefresh.current = true;
             }
             else if (button === 0 && !isPress && selection.current) {
@@ -351,7 +385,7 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
               const line = buf.getLine(buf.viewportY + y);
               if (!line) { textLines.push(''); continue; }
               const sx = y === sel.startRow ? sel.startCol : 0;
-              const ex = y === sel.endRow ? sel.endCol : cols - 1;
+              const ex = y === sel.endRow ? sel.endCol : dimsRef.current.cols - 1;
               let t = '';
               for (let x = sx; x <= ex; x++) {
                 const cell = line.getCell(x);
@@ -393,16 +427,20 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
     shell.onExit(() => {
       process.stdout.write('\x1b[?1002l\x1b[?1006l');
       clearInterval(refreshId);
+      clearInterval(blinkId);
       process.exit(0);
     });
 
     return () => {
       process.stdout.write('\x1b[?1002l\x1b[?1006l');
       clearInterval(refreshId);
+      clearInterval(blinkId);
       if (flushTimer) clearTimeout(flushTimer);
       stdin?.off("data", handleInput);
       shell.kill();
       term.dispose();
+      termRef.current = null;
+      shellRef.current = null;
     };
   }, []);
 
@@ -417,12 +455,26 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
 
 function AutomateLinuxTerminal() {
   const { stdout } = useStdout();
-  const cols = stdout?.columns || 80;
-  const totalRows = stdout?.rows || 24;
+  const [dims, setDims] = useState(() => ({
+    cols: stdout?.columns || 80,
+    rows: stdout?.rows || 24,
+  }));
+
+  useEffect(() => {
+    const onResize = () => {
+      setDims({
+        cols: stdout?.columns || 80,
+        rows: stdout?.rows || 24,
+      });
+    };
+    stdout?.on("resize", onResize);
+    return () => { stdout?.off("resize", onResize); };
+  }, [stdout]);
+
   return (
-    <Box width={cols} height={totalRows}>
-      <TerminalEmulator rows={totalRows} cols={cols} />
-      <Box position="absolute" marginLeft={cols - 22} paddingRight={1}>
+    <Box width={dims.cols} height={dims.rows}>
+      <TerminalEmulator rows={dims.rows} cols={dims.cols} />
+      <Box position="absolute" marginLeft={dims.cols - 22} paddingRight={1}>
         <Clock />
       </Box>
     </Box>
