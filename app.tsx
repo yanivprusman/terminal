@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { render, Box, Text, useStdout, useStdin } from "ink";
-import { spawn } from "child_process";
+import { spawn, execFileSync } from "child_process";
+import { readFileSync } from "fs";
 import pty from "node-pty";
 import xterm from "@xterm/headless";
 const { Terminal: XTerminal } = xterm;
@@ -110,9 +111,44 @@ interface ContextMenuState {
   col: number;
   hasSelection: boolean;
   hoverItem: number;
+  claudeSessionId: string | null;
 }
 
 const EMPTY_SPAN: Span = { text: " ", bold: false, dim: false, italic: false, underline: false, strikethrough: false };
+
+function detectClaudeSession(shellPid: number): string | null {
+  let pids: number[];
+  try {
+    const output = execFileSync('pgrep', ['-x', 'claude'], { encoding: 'utf-8', timeout: 1000 });
+    pids = output.trim().split('\n').filter(Boolean).map(Number);
+  } catch {
+    return null;
+  }
+  for (const pid of pids) {
+    let current = pid;
+    for (let i = 0; i < 10; i++) {
+      try {
+        const stat = readFileSync(`/proc/${current}/stat`, 'utf-8');
+        const ppid = parseInt(stat.split(') ')[1]?.split(' ')[1] || '0');
+        if (ppid === shellPid) {
+          try {
+            const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf-8');
+            const args = cmdline.split('\0').filter(Boolean);
+            for (let j = 0; j < args.length; j++) {
+              if ((args[j] === '--session-id' || args[j] === '-r') && args[j + 1]) {
+                return args[j + 1];
+              }
+            }
+          } catch {}
+          return 'unknown';
+        }
+        if (ppid <= 1) break;
+        current = ppid;
+      } catch { break; }
+    }
+  }
+  return null;
+}
 
 function readBufferRow(
   term: InstanceType<typeof XTerminal>,
@@ -232,22 +268,36 @@ const TerminalLine = React.memo(function TerminalLine({ spans }: { spans: Span[]
   );
 });
 
+const MENU_INNER = 20;
+const menuPad = (s: string) => (s + " ".repeat(MENU_INNER)).slice(0, MENU_INNER);
+const menuBorder = "─".repeat(MENU_INNER);
+
 function ContextMenuOverlay({ menu }: { menu: ContextMenuState }) {
   const copyColor = menu.hasSelection ? "#ffffff" : "#666666";
+  const sessionText = menu.claudeSessionId
+    ? `session: ${menu.claudeSessionId.slice(0, 8)}`
+    : "no claude session";
+  const sessionColor = menu.claudeSessionId ? "#8ae234" : "#666666";
   return (
     <Box position="absolute" marginTop={menu.row} marginLeft={menu.col} flexDirection="column">
-      <Text backgroundColor="#2d2d2d" color="#888888">{"╭────────╮"}</Text>
+      <Text backgroundColor="#2d2d2d" color="#888888">{`╭${menuBorder}╮`}</Text>
       <Text>
         <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
-        <Text backgroundColor={menu.hoverItem === 0 ? "#3465a4" : "#2d2d2d"} color={copyColor}>{" Copy   "}</Text>
+        <Text backgroundColor={menu.hoverItem === 0 ? "#3465a4" : "#2d2d2d"} color={copyColor}>{menuPad(" Copy")}</Text>
         <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
       </Text>
       <Text>
         <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
-        <Text backgroundColor={menu.hoverItem === 1 ? "#3465a4" : "#2d2d2d"} color="#ffffff">{" Paste  "}</Text>
+        <Text backgroundColor={menu.hoverItem === 1 ? "#3465a4" : "#2d2d2d"} color="#ffffff">{menuPad(" Paste")}</Text>
         <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
       </Text>
-      <Text backgroundColor="#2d2d2d" color="#888888">{"╰────────╯"}</Text>
+      <Text backgroundColor="#2d2d2d" color="#888888">{`├${menuBorder}┤`}</Text>
+      <Text>
+        <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
+        <Text backgroundColor={menu.hoverItem === 2 ? "#3465a4" : "#2d2d2d"} color={sessionColor}>{menuPad(` ${sessionText}`)}</Text>
+        <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
+      </Text>
+      <Text backgroundColor="#2d2d2d" color="#888888">{`╰${menuBorder}╯`}</Text>
     </Box>
   );
 }
@@ -392,14 +442,15 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
 
     const openMenu = (row: number, col: number) => {
       const d = dimsRef.current;
-      const menuH = 4, menuW = 10;
+      const menuH = 6, menuW = MENU_INNER + 2;
       const r = Math.max(0, Math.min(row, d.rows - menuH));
       const c = Math.max(0, Math.min(col, d.cols - menuW));
       const hasSel = !!selection.current && (() => {
         const s = normalizeSelection(selection.current!);
         return !(s.startRow === s.endRow && s.startCol === s.endCol);
       })();
-      ctxMenuRef.current = { row: r, col: c, hasSelection: hasSel, hoverItem: -1 };
+      const claudeSessionId = detectClaudeSession(shell.pid);
+      ctxMenuRef.current = { row: r, col: c, hasSelection: hasSel, hoverItem: -1, claudeSessionId };
       setCtxMenu({ ...ctxMenuRef.current });
       process.stdout.write('\x1b[?1003h');
     };
@@ -426,8 +477,9 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
               const mRow = parseInt(sgrMatch[3]) - 1;
               const isPress = sgrMatch[4] === 'M';
               const m = ctxMenuRef.current!;
-              const itemIdx = (mRow - m.row) === 1 ? 0 : (mRow - m.row) === 2 ? 1 : -1;
-              const onItem = itemIdx >= 0 && (mCol - m.col) >= 1 && (mCol - m.col) <= 8;
+              const rowOff = mRow - m.row;
+              const itemIdx = rowOff === 1 ? 0 : rowOff === 2 ? 1 : rowOff === 4 ? 2 : -1;
+              const onItem = itemIdx >= 0 && (mCol - m.col) >= 1 && (mCol - m.col) <= MENU_INNER;
               if (button === 35 || button === 32 || button === 34) {
                 const h = onItem ? itemIdx : -1;
                 if (h !== m.hoverItem) {
@@ -438,6 +490,10 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
               } else if (button === 0 && isPress) {
                 if (onItem && itemIdx === 0 && m.hasSelection) copySelectionToClipboard();
                 else if (onItem && itemIdx === 1) pasteFromClipboard();
+                else if (onItem && itemIdx === 2 && m.claudeSessionId) {
+                  const clip = spawn("xclip", ["-selection", "clipboard"], { stdio: ["pipe", "ignore", "ignore"] });
+                  clip.stdin.end(m.claudeSessionId);
+                }
                 closeMenu();
               } else if (button === 2 && isPress) {
                 closeMenu();
