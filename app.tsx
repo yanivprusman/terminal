@@ -107,6 +107,7 @@ function isCellSelected(row: number, col: number, sel: Selection): boolean {
 }
 
 interface ContextMenuState {
+  kind: 'clipboard' | 'session';
   row: number;
   col: number;
   hasSelection: boolean;
@@ -268,36 +269,43 @@ const TerminalLine = React.memo(function TerminalLine({ spans }: { spans: Span[]
   );
 });
 
-const MENU_INNER = 20;
-const menuPad = (s: string) => (s + " ".repeat(MENU_INNER)).slice(0, MENU_INNER);
-const menuBorder = "─".repeat(MENU_INNER);
+const SESSION_MENU_INNER = 20;
+const sessionMenuPad = (s: string) => (s + " ".repeat(SESSION_MENU_INNER)).slice(0, SESSION_MENU_INNER);
+const sessionMenuBorder = "─".repeat(SESSION_MENU_INNER);
 
 function ContextMenuOverlay({ menu }: { menu: ContextMenuState }) {
+  if (menu.kind === 'session') {
+    const sessionText = menu.claudeSessionId
+      ? `session: ${menu.claudeSessionId.slice(0, 8)}`
+      : "no claude session";
+    const sessionColor = menu.claudeSessionId ? "#8ae234" : "#666666";
+    return (
+      <Box position="absolute" marginTop={menu.row} marginLeft={menu.col} flexDirection="column">
+        <Text backgroundColor="#2d2d2d" color="#888888">{`╭${sessionMenuBorder}╮`}</Text>
+        <Text>
+          <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
+          <Text backgroundColor={menu.hoverItem === 0 ? "#3465a4" : "#2d2d2d"} color={sessionColor}>{sessionMenuPad(` ${sessionText}`)}</Text>
+          <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
+        </Text>
+        <Text backgroundColor="#2d2d2d" color="#888888">{`╰${sessionMenuBorder}╯`}</Text>
+      </Box>
+    );
+  }
   const copyColor = menu.hasSelection ? "#ffffff" : "#666666";
-  const sessionText = menu.claudeSessionId
-    ? `session: ${menu.claudeSessionId.slice(0, 8)}`
-    : "no claude session";
-  const sessionColor = menu.claudeSessionId ? "#8ae234" : "#666666";
   return (
     <Box position="absolute" marginTop={menu.row} marginLeft={menu.col} flexDirection="column">
-      <Text backgroundColor="#2d2d2d" color="#888888">{`╭${menuBorder}╮`}</Text>
+      <Text backgroundColor="#2d2d2d" color="#888888">{"╭────────╮"}</Text>
       <Text>
         <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
-        <Text backgroundColor={menu.hoverItem === 0 ? "#3465a4" : "#2d2d2d"} color={copyColor}>{menuPad(" Copy")}</Text>
+        <Text backgroundColor={menu.hoverItem === 0 ? "#3465a4" : "#2d2d2d"} color={copyColor}>{" Copy   "}</Text>
         <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
       </Text>
       <Text>
         <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
-        <Text backgroundColor={menu.hoverItem === 1 ? "#3465a4" : "#2d2d2d"} color="#ffffff">{menuPad(" Paste")}</Text>
+        <Text backgroundColor={menu.hoverItem === 1 ? "#3465a4" : "#2d2d2d"} color="#ffffff">{" Paste  "}</Text>
         <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
       </Text>
-      <Text backgroundColor="#2d2d2d" color="#888888">{`├${menuBorder}┤`}</Text>
-      <Text>
-        <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
-        <Text backgroundColor={menu.hoverItem === 2 ? "#3465a4" : "#2d2d2d"} color={sessionColor}>{menuPad(` ${sessionText}`)}</Text>
-        <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
-      </Text>
-      <Text backgroundColor="#2d2d2d" color="#888888">{`╰${menuBorder}╯`}</Text>
+      <Text backgroundColor="#2d2d2d" color="#888888">{"╰────────╯"}</Text>
     </Box>
   );
 }
@@ -442,15 +450,23 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
 
     const openMenu = (row: number, col: number) => {
       const d = dimsRef.current;
-      const menuH = 6, menuW = MENU_INNER + 2;
-      const r = Math.max(0, Math.min(row, d.rows - menuH));
-      const c = Math.max(0, Math.min(col, d.cols - menuW));
-      const hasSel = !!selection.current && (() => {
-        const s = normalizeSelection(selection.current!);
-        return !(s.startRow === s.endRow && s.startCol === s.endCol);
-      })();
-      const claudeSessionId = detectClaudeSession(shell.pid);
-      ctxMenuRef.current = { row: r, col: c, hasSelection: hasSel, hoverItem: -1, claudeSessionId };
+      const isClockRegion = row === 0 && col >= d.cols - 22;
+      if (isClockRegion) {
+        const menuH = 3, menuW = SESSION_MENU_INNER + 2;
+        const r = Math.max(0, Math.min(row, d.rows - menuH));
+        const c = Math.max(0, Math.min(col, d.cols - menuW));
+        const claudeSessionId = detectClaudeSession(shell.pid);
+        ctxMenuRef.current = { kind: 'session', row: r, col: c, hasSelection: false, hoverItem: -1, claudeSessionId };
+      } else {
+        const menuH = 4, menuW = 10;
+        const r = Math.max(0, Math.min(row, d.rows - menuH));
+        const c = Math.max(0, Math.min(col, d.cols - menuW));
+        const hasSel = !!selection.current && (() => {
+          const s = normalizeSelection(selection.current!);
+          return !(s.startRow === s.endRow && s.startCol === s.endCol);
+        })();
+        ctxMenuRef.current = { kind: 'clipboard', row: r, col: c, hasSelection: hasSel, hoverItem: -1, claudeSessionId: null };
+      }
       setCtxMenu({ ...ctxMenuRef.current });
       process.stdout.write('\x1b[?1003h');
     };
@@ -478,8 +494,16 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
               const isPress = sgrMatch[4] === 'M';
               const m = ctxMenuRef.current!;
               const rowOff = mRow - m.row;
-              const itemIdx = rowOff === 1 ? 0 : rowOff === 2 ? 1 : rowOff === 4 ? 2 : -1;
-              const onItem = itemIdx >= 0 && (mCol - m.col) >= 1 && (mCol - m.col) <= MENU_INNER;
+              let itemIdx: number;
+              let menuW: number;
+              if (m.kind === 'session') {
+                itemIdx = rowOff === 1 ? 0 : -1;
+                menuW = SESSION_MENU_INNER;
+              } else {
+                itemIdx = rowOff === 1 ? 0 : rowOff === 2 ? 1 : -1;
+                menuW = 8;
+              }
+              const onItem = itemIdx >= 0 && (mCol - m.col) >= 1 && (mCol - m.col) <= menuW;
               if (button === 35 || button === 32 || button === 34) {
                 const h = onItem ? itemIdx : -1;
                 if (h !== m.hoverItem) {
@@ -488,9 +512,10 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
                   setCtxMenu(updated);
                 }
               } else if (button === 0 && isPress) {
-                if (onItem && itemIdx === 0 && m.hasSelection) copySelectionToClipboard();
-                else if (onItem && itemIdx === 1) pasteFromClipboard();
-                else if (onItem && itemIdx === 2 && m.claudeSessionId) {
+                if (m.kind === 'clipboard') {
+                  if (onItem && itemIdx === 0 && m.hasSelection) copySelectionToClipboard();
+                  else if (onItem && itemIdx === 1) pasteFromClipboard();
+                } else if (m.kind === 'session' && onItem && itemIdx === 0 && m.claudeSessionId) {
                   const clip = spawn("xclip", ["-selection", "clipboard"], { stdio: ["pipe", "ignore", "ignore"] });
                   clip.stdin.end(m.claudeSessionId);
                 }
