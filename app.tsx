@@ -117,6 +117,18 @@ interface ContextMenuState {
 
 const EMPTY_SPAN: Span = { text: " ", bold: false, dim: false, italic: false, underline: false, strikethrough: false };
 
+function spansEqual(a: Span[], b: Span[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].text !== b[i].text ||
+        a[i].fg !== b[i].fg || a[i].bg !== b[i].bg ||
+        a[i].bold !== b[i].bold || a[i].dim !== b[i].dim ||
+        a[i].italic !== b[i].italic || a[i].underline !== b[i].underline ||
+        a[i].strikethrough !== b[i].strikethrough) return false;
+  }
+  return true;
+}
+
 function detectClaudeSession(shellPid: number): string | null {
   let pids: number[];
   try {
@@ -211,14 +223,19 @@ function readBufferRow(
   return spans;
 }
 
-function readBuffer(term: InstanceType<typeof XTerminal>, rows: number, cols: number, selection?: Selection | null, cursorVisible = true): Line[] {
+function readBuffer(term: InstanceType<typeof XTerminal>, rows: number, cols: number, cache: Line[], selection?: Selection | null, cursorVisible = true): Line[] {
   const buf = term.buffer.active;
   const startY = buf.viewportY;
   const cursorRow = buf.cursorY + buf.baseY - startY;
   const cursorCol = buf.cursorX;
   const lines: Line[] = [];
   for (let y = 0; y < rows; y++) {
-    lines.push(readBufferRow(term, startY + y, cols, cursorVisible, cursorRow, cursorCol, y, selection));
+    const row = readBufferRow(term, startY + y, cols, cursorVisible, cursorRow, cursorCol, y, selection);
+    if (cache[y] && spansEqual(cache[y], row)) {
+      lines.push(cache[y]);
+    } else {
+      lines.push(row);
+    }
   }
   return lines;
 }
@@ -343,7 +360,7 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
   useEffect(() => {
     setRawMode(true);
 
-    const term = new XTerminal({ rows, cols, allowProposedApi: true });
+    const term = new XTerminal({ rows, cols, scrollback: 500, allowProposedApi: true });
     termRef.current = term;
 
     const shellPath = process.env.SHELL || "bash";
@@ -366,37 +383,42 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
     const blinkId = setInterval(() => {
       cursorVisible.current = !cursorVisible.current;
       needsRefresh.current = true;
-    }, 530);
+    }, 1000);
 
     const refreshId = setInterval(() => {
-      if (needsRefresh.current) {
-        needsRefresh.current = false;
-        const d = dimsRef.current;
-        const buf = term.buffer.active;
-        const curRow = buf.cursorY + buf.baseY - buf.viewportY;
-        const curCol = buf.cursorX;
-        if (curRow !== lastCursorPos.current.row || curCol !== lastCursorPos.current.col) {
-          lastCursorPos.current = { row: curRow, col: curCol };
-          cursorVisible.current = true;
-          contentDirty.current = true;
-        }
-        let newLines: Line[];
-        if (contentDirty.current || contentCache.current.length !== d.rows) {
-          contentDirty.current = false;
-          newLines = readBuffer(term, d.rows, d.cols, selection.current, cursorVisible.current);
-        } else {
-          const cached = contentCache.current;
-          const startY = buf.viewportY;
-          newLines = cached.map((line, y) =>
-            y === curRow
-              ? readBufferRow(term, startY + y, d.cols, cursorVisible.current, curRow, curCol, y, selection.current)
-              : line
-          );
-        }
-        contentCache.current = newLines;
-        setLines(newLines);
+      if (!needsRefresh.current) return;
+      needsRefresh.current = false;
+      const d = dimsRef.current;
+      const buf = term.buffer.active;
+      const curRow = buf.cursorY + buf.baseY - buf.viewportY;
+      const curCol = buf.cursorX;
+      if (curRow !== lastCursorPos.current.row || curCol !== lastCursorPos.current.col) {
+        lastCursorPos.current = { row: curRow, col: curCol };
+        cursorVisible.current = true;
+        contentDirty.current = true;
       }
-    }, 16);
+      const cached = contentCache.current;
+      let newLines: Line[];
+      if (contentDirty.current || cached.length !== d.rows) {
+        contentDirty.current = false;
+        newLines = readBuffer(term, d.rows, d.cols, cached, selection.current, cursorVisible.current);
+      } else {
+        const startY = buf.viewportY;
+        const cursorRow = readBufferRow(term, startY + curRow, d.cols, cursorVisible.current, curRow, curCol, curRow, selection.current);
+        if (cached[curRow] && spansEqual(cached[curRow], cursorRow)) return;
+        newLines = cached.slice();
+        newLines[curRow] = cursorRow;
+      }
+      let anyChanged = cached.length !== newLines.length;
+      if (!anyChanged) {
+        for (let i = 0; i < newLines.length; i++) {
+          if (newLines[i] !== cached[i]) { anyChanged = true; break; }
+        }
+      }
+      if (!anyChanged) return;
+      contentCache.current = newLines;
+      setLines(newLines);
+    }, 50);
 
     process.stdout.write('\x1b[?1002h\x1b[?1006h');
 
