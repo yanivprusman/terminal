@@ -105,69 +105,84 @@ function isCellSelected(row: number, col: number, sel: Selection): boolean {
   return true;
 }
 
+interface ContextMenuState {
+  row: number;
+  col: number;
+  hasSelection: boolean;
+  hoverItem: number;
+}
+
+const EMPTY_SPAN: Span = { text: " ", bold: false, dim: false, italic: false, underline: false, strikethrough: false };
+
+function readBufferRow(
+  term: InstanceType<typeof XTerminal>,
+  absY: number,
+  cols: number,
+  cursorVisible: boolean,
+  cursorRow: number,
+  cursorCol: number,
+  viewportRow: number,
+  selection?: Selection | null,
+): Span[] {
+  const bufLine = term.buffer.active.getLine(absY);
+  if (!bufLine) return [EMPTY_SPAN];
+
+  const spans: Span[] = [];
+  let cur: Span | null = null;
+
+  for (let x = 0; x < cols; x++) {
+    const cell = bufLine.getCell(x);
+    if (!cell || cell.getWidth() === 0) continue;
+
+    const chars = cell.getChars() || " ";
+    const inverse = cell.isInverse() !== 0;
+    const rawFg = fgColor(cell);
+    const rawBg = bgColor(cell);
+    let fg = inverse ? rawBg : rawFg;
+    let bg = inverse ? rawFg : rawBg;
+
+    if (cursorVisible && viewportRow === cursorRow && x === cursorCol) {
+      const t = fg;
+      fg = bg || "#000000";
+      bg = t || "#d3d7cf";
+    }
+    if (selection && isCellSelected(viewportRow, x, selection)) {
+      fg = "#ffffff";
+      bg = "#3465a4";
+    }
+    const bold = cell.isBold() !== 0;
+    const dim = cell.isDim() !== 0;
+    const italic = cell.isItalic() !== 0;
+    const underline = cell.isUnderline() !== 0;
+    const strikethrough = cell.isStrikethrough() !== 0;
+
+    if (
+      cur &&
+      cur.fg === fg && cur.bg === bg &&
+      cur.bold === bold && cur.dim === dim &&
+      cur.italic === italic && cur.underline === underline &&
+      cur.strikethrough === strikethrough
+    ) {
+      cur.text += chars;
+    } else {
+      cur = { text: chars, fg, bg, bold, dim, italic, underline, strikethrough };
+      spans.push(cur);
+    }
+  }
+
+  if (spans.length === 0) return [EMPTY_SPAN];
+  return spans;
+}
+
 function readBuffer(term: InstanceType<typeof XTerminal>, rows: number, cols: number, selection?: Selection | null, cursorVisible = true): Line[] {
   const buf = term.buffer.active;
-  const lines: Line[] = [];
   const startY = buf.viewportY;
   const cursorRow = buf.cursorY + buf.baseY - startY;
   const cursorCol = buf.cursorX;
-
+  const lines: Line[] = [];
   for (let y = 0; y < rows; y++) {
-    const bufLine = buf.getLine(startY + y);
-    if (!bufLine) {
-      lines.push([{ text: " ", bold: false, dim: false, italic: false, underline: false, strikethrough: false }]);
-      continue;
-    }
-
-    const spans: Span[] = [];
-    let cur: Span | null = null;
-
-    for (let x = 0; x < cols; x++) {
-      const cell = bufLine.getCell(x);
-      if (!cell || cell.getWidth() === 0) continue;
-
-      const chars = cell.getChars() || " ";
-      const inverse = cell.isInverse() !== 0;
-      const rawFg = fgColor(cell);
-      const rawBg = bgColor(cell);
-      let fg = inverse ? rawBg : rawFg;
-      let bg = inverse ? rawFg : rawBg;
-
-      if (cursorVisible && y === cursorRow && x === cursorCol) {
-        const t = fg;
-        fg = bg || "#000000";
-        bg = t || "#d3d7cf";
-      }
-      if (selection && isCellSelected(y, x, selection)) {
-        fg = "#ffffff";
-        bg = "#3465a4";
-      }
-      const bold = cell.isBold() !== 0;
-      const dim = cell.isDim() !== 0;
-      const italic = cell.isItalic() !== 0;
-      const underline = cell.isUnderline() !== 0;
-      const strikethrough = cell.isStrikethrough() !== 0;
-
-      if (
-        cur &&
-        cur.fg === fg && cur.bg === bg &&
-        cur.bold === bold && cur.dim === dim &&
-        cur.italic === italic && cur.underline === underline &&
-        cur.strikethrough === strikethrough
-      ) {
-        cur.text += chars;
-      } else {
-        cur = { text: chars, fg, bg, bold, dim, italic, underline, strikethrough };
-        spans.push(cur);
-      }
-    }
-
-    if (spans.length === 0) {
-      spans.push({ text: " ", bold: false, dim: false, italic: false, underline: false, strikethrough: false });
-    }
-    lines.push(spans);
+    lines.push(readBufferRow(term, startY + y, cols, cursorVisible, cursorRow, cursorCol, y, selection));
   }
-
   return lines;
 }
 
@@ -196,7 +211,7 @@ function Clock() {
   );
 }
 
-function TerminalLine({ spans }: { spans: Span[] }) {
+const TerminalLine = React.memo(function TerminalLine({ spans }: { spans: Span[] }) {
   return (
     <Text wrap="truncate">
       {spans.map((s, i) => (
@@ -215,6 +230,26 @@ function TerminalLine({ spans }: { spans: Span[] }) {
       ))}
     </Text>
   );
+});
+
+function ContextMenuOverlay({ menu }: { menu: ContextMenuState }) {
+  const copyColor = menu.hasSelection ? "#ffffff" : "#666666";
+  return (
+    <Box position="absolute" marginTop={menu.row} marginLeft={menu.col} flexDirection="column">
+      <Text backgroundColor="#2d2d2d" color="#888888">{"╭────────╮"}</Text>
+      <Text>
+        <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
+        <Text backgroundColor={menu.hoverItem === 0 ? "#3465a4" : "#2d2d2d"} color={copyColor}>{" Copy   "}</Text>
+        <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
+      </Text>
+      <Text>
+        <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
+        <Text backgroundColor={menu.hoverItem === 1 ? "#3465a4" : "#2d2d2d"} color="#ffffff">{" Paste  "}</Text>
+        <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
+      </Text>
+      <Text backgroundColor="#2d2d2d" color="#888888">{"╰────────╯"}</Text>
+    </Box>
+  );
 }
 
 function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
@@ -231,6 +266,10 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
   const dimsRef = useRef({ rows, cols });
   const cursorVisible = useRef(true);
   const lastCursorPos = useRef({ row: -1, col: -1 });
+  const contentDirty = useRef(true);
+  const contentCache = useRef<Line[]>([]);
+  const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
+  const ctxMenuRef = useRef<ContextMenuState | null>(null);
 
   useEffect(() => {
     if (dimsRef.current.rows === rows && dimsRef.current.cols === cols && termRef.current) return;
@@ -238,6 +277,7 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
     if (termRef.current && shellRef.current) {
       termRef.current.resize(cols, rows);
       shellRef.current.resize(cols, rows);
+      contentDirty.current = true;
       needsRefresh.current = true;
     }
   }, [rows, cols]);
@@ -260,6 +300,7 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
 
     shell.onData((data: string) => {
       term.write(data, () => {
+        contentDirty.current = true;
         needsRefresh.current = true;
       });
     });
@@ -279,8 +320,23 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
         if (curRow !== lastCursorPos.current.row || curCol !== lastCursorPos.current.col) {
           lastCursorPos.current = { row: curRow, col: curCol };
           cursorVisible.current = true;
+          contentDirty.current = true;
         }
-        setLines(readBuffer(term, d.rows, d.cols, selection.current, cursorVisible.current));
+        let newLines: Line[];
+        if (contentDirty.current || contentCache.current.length !== d.rows) {
+          contentDirty.current = false;
+          newLines = readBuffer(term, d.rows, d.cols, selection.current, cursorVisible.current);
+        } else {
+          const cached = contentCache.current;
+          const startY = buf.viewportY;
+          newLines = cached.map((line, y) =>
+            y === curRow
+              ? readBufferRow(term, startY + y, d.cols, cursorVisible.current, curRow, curCol, y, selection.current)
+              : line
+          );
+        }
+        contentCache.current = newLines;
+        setLines(newLines);
       }
     }, 16);
 
@@ -296,8 +352,113 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
       }
     };
 
+    const copySelectionToClipboard = () => {
+      if (!selection.current) return;
+      const sel = normalizeSelection(selection.current);
+      if (sel.startRow === sel.endRow && sel.startCol === sel.endCol) return;
+      const buf = term.buffer.active;
+      const textLines: string[] = [];
+      for (let y = sel.startRow; y <= sel.endRow; y++) {
+        const line = buf.getLine(buf.viewportY + y);
+        if (!line) { textLines.push(''); continue; }
+        const sx = y === sel.startRow ? sel.startCol : 0;
+        const ex = y === sel.endRow ? sel.endCol : dimsRef.current.cols - 1;
+        let t = '';
+        for (let x = sx; x <= ex; x++) {
+          const cell = line.getCell(x);
+          t += cell ? (cell.getChars() || ' ') : ' ';
+        }
+        textLines.push(t.trimEnd());
+      }
+      const text = textLines.join('\n');
+      if (text.trim()) {
+        const clip = spawn("xclip", ["-selection", "clipboard"], { stdio: ["pipe", "ignore", "ignore"] });
+        clip.stdin.end(text);
+      }
+      selection.current = null;
+      needsRefresh.current = true;
+    };
+
+    const pasteFromClipboard = () => {
+      const clip = spawn("xclip", ["-selection", "clipboard", "-o"], { stdio: ["ignore", "pipe", "ignore"] });
+      let data = '';
+      clip.stdout.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+      clip.on('close', () => {
+        if (data && shellRef.current) {
+          shellRef.current.write(data);
+        }
+      });
+    };
+
+    const openMenu = (row: number, col: number) => {
+      const d = dimsRef.current;
+      const menuH = 4, menuW = 10;
+      const r = Math.max(0, Math.min(row, d.rows - menuH));
+      const c = Math.max(0, Math.min(col, d.cols - menuW));
+      const hasSel = !!selection.current && (() => {
+        const s = normalizeSelection(selection.current!);
+        return !(s.startRow === s.endRow && s.startCol === s.endCol);
+      })();
+      ctxMenuRef.current = { row: r, col: c, hasSelection: hasSel, hoverItem: -1 };
+      setCtxMenu({ ...ctxMenuRef.current });
+      process.stdout.write('\x1b[?1003h');
+    };
+
+    const closeMenu = () => {
+      if (!ctxMenuRef.current) return;
+      ctxMenuRef.current = null;
+      setCtxMenu(null);
+      process.stdout.write('\x1b[?1003l');
+    };
+
     const processInput = () => {
       if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+
+      if (ctxMenuRef.current) {
+        let pos = 0;
+        while (pos < inBuf.length) {
+          if (inBuf[pos] === '\x1b') {
+            const rest = inBuf.slice(pos);
+            const sgrMatch = rest.match(/^\x1b\[<(\d+);(\d+);(\d+)([Mm])/);
+            if (sgrMatch) {
+              const button = parseInt(sgrMatch[1]);
+              const mCol = parseInt(sgrMatch[2]) - 1;
+              const mRow = parseInt(sgrMatch[3]) - 1;
+              const isPress = sgrMatch[4] === 'M';
+              const m = ctxMenuRef.current!;
+              const itemIdx = (mRow - m.row) === 1 ? 0 : (mRow - m.row) === 2 ? 1 : -1;
+              const onItem = itemIdx >= 0 && (mCol - m.col) >= 1 && (mCol - m.col) <= 8;
+              if (button === 35 || button === 32 || button === 34) {
+                const h = onItem ? itemIdx : -1;
+                if (h !== m.hoverItem) {
+                  const updated: ContextMenuState = { ...m, hoverItem: h };
+                  ctxMenuRef.current = updated;
+                  setCtxMenu(updated);
+                }
+              } else if (button === 0 && isPress) {
+                if (onItem && itemIdx === 0 && m.hasSelection) copySelectionToClipboard();
+                else if (onItem && itemIdx === 1) pasteFromClipboard();
+                closeMenu();
+              } else if (button === 2 && isPress) {
+                closeMenu();
+                openMenu(mRow, mCol);
+              } else if (button === 64 || button === 65) {
+                closeMenu();
+              }
+              pos += sgrMatch[0].length; continue;
+            }
+            if (/^\x1b(\[(<([\d;]*)?)?)?$/.test(rest)) {
+              inBuf = rest;
+              flushTimer = setTimeout(() => { closeMenu(); inBuf = ''; }, 50);
+              return;
+            }
+            closeMenu(); inBuf = ''; return;
+          }
+          closeMenu(); inBuf = ''; return;
+        }
+        inBuf = ''; return;
+      }
+
       let pos = 0;
       while (pos < inBuf.length) {
         if (inBuf[pos] === '\x1b') {
@@ -305,11 +466,13 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
 
           if (rest.startsWith('\x1b[5;2~')) {
             term.scrollPages(-1);
+            contentDirty.current = true;
             needsRefresh.current = true;
             pos += 6; continue;
           }
           if (rest.startsWith('\x1b[6;2~')) {
             term.scrollPages(1);
+            contentDirty.current = true;
             needsRefresh.current = true;
             pos += 6; continue;
           }
@@ -321,8 +484,11 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
             const mRow = parseInt(sgrMatch[3]) - 1;
             const isPress = sgrMatch[4] === 'M';
 
-            if (button === 64) { term.scrollLines(-3); needsRefresh.current = true; }
-            else if (button === 65) { term.scrollLines(3); needsRefresh.current = true; }
+            if (button === 64) { term.scrollLines(-3); contentDirty.current = true; needsRefresh.current = true; }
+            else if (button === 65) { term.scrollLines(3); contentDirty.current = true; needsRefresh.current = true; }
+            else if (button === 2) {
+              if (isPress) openMenu(mRow, mCol);
+            }
             else if (term.modes.mouseTrackingMode !== 'none') {
               shell.write(sgrMatch[0]);
             }
@@ -331,18 +497,21 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
               const r = Math.max(0, Math.min(mRow, d.rows - 1));
               const c = Math.max(0, Math.min(mCol, d.cols - 1));
               selection.current = { startRow: r, startCol: c, endRow: r, endCol: c };
+              contentDirty.current = true;
               needsRefresh.current = true;
             }
             else if (button === 32 && isPress && selection.current) {
               const d = dimsRef.current;
               selection.current.endRow = Math.max(0, Math.min(mRow, d.rows - 1));
               selection.current.endCol = Math.max(0, Math.min(mCol, d.cols - 1));
+              contentDirty.current = true;
               needsRefresh.current = true;
             }
             else if (button === 0 && !isPress && selection.current) {
               const sel = normalizeSelection(selection.current);
               if (sel.startRow === sel.endRow && sel.startCol === sel.endCol) {
                 selection.current = null;
+                contentDirty.current = true;
                 needsRefresh.current = true;
               }
             }
@@ -379,29 +548,9 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
         if (inBuf[pos] === '\x03' && selection.current) {
           const sel = normalizeSelection(selection.current);
           if (!(sel.startRow === sel.endRow && sel.startCol === sel.endCol)) {
-            const buf = term.buffer.active;
-            const textLines: string[] = [];
-            for (let y = sel.startRow; y <= sel.endRow; y++) {
-              const line = buf.getLine(buf.viewportY + y);
-              if (!line) { textLines.push(''); continue; }
-              const sx = y === sel.startRow ? sel.startCol : 0;
-              const ex = y === sel.endRow ? sel.endCol : dimsRef.current.cols - 1;
-              let t = '';
-              for (let x = sx; x <= ex; x++) {
-                const cell = line.getCell(x);
-                t += cell ? (cell.getChars() || ' ') : ' ';
-              }
-              textLines.push(t.trimEnd());
-            }
-            const text = textLines.join('\n');
-            if (text.trim()) {
-              const clip = spawn("xclip", ["-selection", "clipboard"], { stdio: ["pipe", "ignore", "ignore"] });
-              clip.stdin.end(text);
-            }
+            copySelectionToClipboard();
+            pos++; continue;
           }
-          selection.current = null;
-          needsRefresh.current = true;
-          pos++; continue;
         }
 
         let end = pos + 1;
@@ -409,9 +558,10 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
 
         if (term.buffer.active.viewportY !== term.buffer.active.baseY) {
           term.scrollToBottom();
+          contentDirty.current = true;
           needsRefresh.current = true;
         }
-        if (selection.current) { selection.current = null; needsRefresh.current = true; }
+        if (selection.current) { selection.current = null; contentDirty.current = true; needsRefresh.current = true; }
         shell.write(inBuf.slice(pos, end));
         pos = end;
       }
@@ -425,14 +575,14 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
     stdin?.on("data", handleInput);
 
     shell.onExit(() => {
-      process.stdout.write('\x1b[?1002l\x1b[?1006l');
+      process.stdout.write('\x1b[?1002l\x1b[?1006l\x1b[?1003l');
       clearInterval(refreshId);
       clearInterval(blinkId);
       process.exit(0);
     });
 
     return () => {
-      process.stdout.write('\x1b[?1002l\x1b[?1006l');
+      process.stdout.write('\x1b[?1002l\x1b[?1006l\x1b[?1003l');
       clearInterval(refreshId);
       clearInterval(blinkId);
       if (flushTimer) clearTimeout(flushTimer);
@@ -449,6 +599,7 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
       {lines.map((spans, i) => (
         <TerminalLine key={i} spans={spans} />
       ))}
+      {ctxMenu && <ContextMenuOverlay menu={ctxMenu} />}
     </Box>
   );
 }
