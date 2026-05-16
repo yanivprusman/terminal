@@ -1,10 +1,88 @@
 import React, { useState, useEffect, useRef } from "react";
 import { render, Box, Text, useStdout, useStdin } from "ink";
 import { spawn, execFileSync } from "child_process";
-import { readFileSync } from "fs";
+import { readFileSync, writeFileSync, unlinkSync, createWriteStream } from "fs";
+import type { WriteStream } from "fs";
 import pty from "node-pty";
 import xterm from "@xterm/headless";
 const { Terminal: XTerminal } = xterm;
+
+// ── Session hosting ────────────────────────────────────────
+// When launched with CLAUDE_SESSION_ID env, this terminal acts as the
+// authoritative session host — writes a metadata file and registers
+// with the dashboard.
+
+const SESSION_ID = process.env.CLAUDE_SESSION_ID || '';
+const TMUX_SESSION = process.env.CLAUDE_TMUX_SESSION || '';
+const APP_NAME = process.env.CLAUDE_APP_NAME || '';
+const LAUNCH_DIR = process.env.CLAUDE_LAUNCH_DIR || process.cwd();
+const SCRIPT_LOG_FILE = process.env.CLAUDE_SCRIPT_LOG_FILE || '';
+const DASHBOARD_PORT = process.env.CLAUDE_DASHBOARD_PORT || '3007';
+
+const METADATA_FILE = SESSION_ID ? `/tmp/automateLinuxTerminal-${SESSION_ID}.json` : '';
+
+function writeMetadata(shellPid: number): void {
+  if (!METADATA_FILE) return;
+  const meta = {
+    claudeSessionId: SESSION_ID,
+    tmuxSession: TMUX_SESSION,
+    appName: APP_NAME,
+    launchDir: LAUNCH_DIR,
+    pid: process.pid,
+    shellPid,
+    startedAt: new Date().toISOString(),
+    scriptLogFile: SCRIPT_LOG_FILE,
+  };
+  writeFileSync(METADATA_FILE, JSON.stringify(meta, null, 2));
+}
+
+function cleanupMetadata(): void {
+  if (!METADATA_FILE) return;
+  try { unlinkSync(METADATA_FILE); } catch {}
+}
+
+if (SESSION_ID) {
+  const onSignal = () => { cleanupMetadata(); process.exit(0); };
+  process.on('SIGTERM', onSignal);
+  process.on('SIGHUP', onSignal);
+}
+
+function registerWithDashboard(shellPid: number): void {
+  if (!SESSION_ID) return;
+  const body = JSON.stringify({
+    sessionId: TMUX_SESSION || `alt-${SESSION_ID.slice(0, 8)}`,
+    claudeSessionId: SESSION_ID,
+    appName: APP_NAME,
+    workDir: LAUNCH_DIR,
+    scriptFile: SCRIPT_LOG_FILE,
+    termTitle: TMUX_SESSION,
+    launchMethod: 'tmux',
+    source: 'terminal',
+    pid: shellPid,
+  });
+  let attempts = 0;
+  const tryRegister = () => {
+    attempts++;
+    fetch(`http://localhost:${DASHBOARD_PORT}/api/claude-sessions/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    }).catch(() => {
+      if (attempts < 10) setTimeout(tryRegister, Math.min(1000 * Math.pow(2, attempts - 1), 30000));
+    });
+  };
+  tryRegister();
+}
+
+function notifySessionEnded(): void {
+  if (!SESSION_ID) return;
+  const sid = TMUX_SESSION || `alt-${SESSION_ID.slice(0, 8)}`;
+  fetch(`http://localhost:${DASHBOARD_PORT}/api/claude-sessions/${sid}/ended`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  }).catch(() => {});
+}
 
 // ── Color conversion ────────────────────────────────────
 // xterm buffer cells store colors as mode + value.
@@ -113,6 +191,7 @@ interface ContextMenuState {
   hasSelection: boolean;
   hoverItem: number;
   claudeSessionId: string | null;
+  claudeCwd: string | null;
 }
 
 const EMPTY_SPAN: Span = { text: " ", bold: false, dim: false, italic: false, underline: false, strikethrough: false };
@@ -129,7 +208,12 @@ function spansEqual(a: Span[], b: Span[]): boolean {
   return true;
 }
 
-function detectClaudeSession(shellPid: number): string | null {
+interface ClaudeSessionInfo {
+  sessionId: string;
+  cwd: string | null;
+}
+
+function detectClaudeSession(shellPid: number): ClaudeSessionInfo | null {
   let pids: number[];
   try {
     const output = execFileSync('pgrep', ['-x', 'claude'], { encoding: 'utf-8', timeout: 1000 });
@@ -144,16 +228,26 @@ function detectClaudeSession(shellPid: number): string | null {
         const stat = readFileSync(`/proc/${current}/stat`, 'utf-8');
         const ppid = parseInt(stat.split(') ')[1]?.split(' ')[1] || '0');
         if (ppid === shellPid) {
+          let sessionId = 'unknown';
+          let cwd: string | null = null;
           try {
             const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf-8');
             const args = cmdline.split('\0').filter(Boolean);
             for (let j = 0; j < args.length; j++) {
               if ((args[j] === '--session-id' || args[j] === '-r') && args[j + 1]) {
-                return args[j + 1];
+                sessionId = args[j + 1];
+                break;
               }
             }
           } catch {}
-          return 'unknown';
+          try {
+            cwd = readFileSync(`/proc/${pid}/cwd`, 'utf-8').replace(/\0/g, '');
+          } catch {
+            try {
+              cwd = execFileSync('readlink', [`/proc/${pid}/cwd`], { encoding: 'utf-8', timeout: 500 }).trim();
+            } catch {}
+          }
+          return { sessionId, cwd };
         }
         if (ppid <= 1) break;
         current = ppid;
@@ -286,7 +380,7 @@ const TerminalLine = React.memo(function TerminalLine({ spans }: { spans: Span[]
   );
 });
 
-const SESSION_MENU_INNER = 20;
+const SESSION_MENU_INNER = 28;
 const sessionMenuPad = (s: string) => (s + " ".repeat(SESSION_MENU_INNER)).slice(0, SESSION_MENU_INNER);
 const sessionMenuBorder = "─".repeat(SESSION_MENU_INNER);
 
@@ -304,6 +398,16 @@ function ContextMenuOverlay({ menu }: { menu: ContextMenuState }) {
           <Text backgroundColor={menu.hoverItem === 0 ? "#3465a4" : "#2d2d2d"} color={sessionColor}>{sessionMenuPad(` ${sessionText}`)}</Text>
           <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
         </Text>
+        {menu.claudeSessionId && menu.claudeCwd && (
+          <>
+            <Text backgroundColor="#2d2d2d" color="#888888">{`├${sessionMenuBorder}┤`}</Text>
+            <Text>
+              <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
+              <Text backgroundColor={menu.hoverItem === 1 ? "#3465a4" : "#2d2d2d"} color="#c4a000">{sessionMenuPad(menu.claudeCwd.length > SESSION_MENU_INNER - 2 ? " " + menu.claudeCwd.slice(0, SESSION_MENU_INNER - 4) + "… " : " " + menu.claudeCwd + " ")}</Text>
+              <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
+            </Text>
+          </>
+        )}
         <Text backgroundColor="#2d2d2d" color="#888888">{`╰${sessionMenuBorder}╯`}</Text>
       </Box>
     );
@@ -368,12 +472,23 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
       name: "xterm-256color",
       cols,
       rows,
-      cwd: process.cwd(),
+      cwd: LAUNCH_DIR || process.cwd(),
       env: { ...process.env, AUTOMATE_LINUX_TERMINAL: "1" } as Record<string, string>,
     });
     shellRef.current = shell;
 
+    // Session hosting: write metadata + register + open script log
+    let scriptLogStream: WriteStream | null = null;
+    if (SESSION_ID) {
+      writeMetadata(shell.pid);
+      registerWithDashboard(shell.pid);
+    }
+    if (SCRIPT_LOG_FILE) {
+      scriptLogStream = createWriteStream(SCRIPT_LOG_FILE, { flags: 'a' });
+    }
+
     shell.onData((data: string) => {
+      if (scriptLogStream) scriptLogStream.write(data);
       term.write(data, () => {
         contentDirty.current = true;
         needsRefresh.current = true;
@@ -474,11 +589,14 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
       const d = dimsRef.current;
       const isClockRegion = row === 0 && col >= d.cols - 22;
       if (isClockRegion) {
-        const menuH = 3, menuW = SESSION_MENU_INNER + 2;
+        const info = detectClaudeSession(shell.pid);
+        const claudeSessionId = info?.sessionId ?? null;
+        const claudeCwd = info?.cwd ?? null;
+        const menuH = claudeSessionId && claudeCwd ? 5 : 3;
+        const menuW = SESSION_MENU_INNER + 2;
         const r = Math.max(0, Math.min(row, d.rows - menuH));
         const c = Math.max(0, Math.min(col, d.cols - menuW));
-        const claudeSessionId = detectClaudeSession(shell.pid);
-        ctxMenuRef.current = { kind: 'session', row: r, col: c, hasSelection: false, hoverItem: -1, claudeSessionId };
+        ctxMenuRef.current = { kind: 'session', row: r, col: c, hasSelection: false, hoverItem: -1, claudeSessionId, claudeCwd };
       } else {
         const menuH = 4, menuW = 10;
         const r = Math.max(0, Math.min(row, d.rows - menuH));
@@ -487,7 +605,7 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
           const s = normalizeSelection(selection.current!);
           return !(s.startRow === s.endRow && s.startCol === s.endCol);
         })();
-        ctxMenuRef.current = { kind: 'clipboard', row: r, col: c, hasSelection: hasSel, hoverItem: -1, claudeSessionId: null };
+        ctxMenuRef.current = { kind: 'clipboard', row: r, col: c, hasSelection: hasSel, hoverItem: -1, claudeSessionId: null, claudeCwd: null };
       }
       setCtxMenu({ ...ctxMenuRef.current });
       process.stdout.write('\x1b[?1003h');
@@ -519,7 +637,7 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
               let itemIdx: number;
               let menuW: number;
               if (m.kind === 'session') {
-                itemIdx = rowOff === 1 ? 0 : -1;
+                itemIdx = rowOff === 1 ? 0 : rowOff === 3 ? 1 : -1;
                 menuW = SESSION_MENU_INNER;
               } else {
                 itemIdx = rowOff === 1 ? 0 : rowOff === 2 ? 1 : -1;
@@ -537,6 +655,9 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
                 if (m.kind === 'clipboard') {
                   if (onItem && itemIdx === 0 && m.hasSelection) copySelectionToClipboard();
                   else if (onItem && itemIdx === 1) pasteFromClipboard();
+                } else if (m.kind === 'session' && onItem && itemIdx === 1 && m.claudeCwd) {
+                  const clip = spawn("xclip", ["-selection", "clipboard"], { stdio: ["pipe", "ignore", "ignore"] });
+                  clip.stdin.end(m.claudeCwd);
                 } else if (m.kind === 'session' && onItem && itemIdx === 0 && m.claudeSessionId) {
                   const clip = spawn("xclip", ["-selection", "clipboard"], { stdio: ["pipe", "ignore", "ignore"] });
                   clip.stdin.end(m.claudeSessionId);
@@ -681,6 +802,9 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
       process.stdout.write('\x1b[?1002l\x1b[?1006l\x1b[?1003l');
       clearInterval(refreshId);
       clearInterval(blinkId);
+      if (scriptLogStream) scriptLogStream.end();
+      cleanupMetadata();
+      notifySessionEnded();
       process.exit(0);
     });
 
