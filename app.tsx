@@ -518,6 +518,10 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
         contentDirty.current = false;
         newLines = readBuffer(term, d.rows, d.cols, cached, selection.current, cursorVisible.current);
       } else {
+        // Cursor is outside the visible viewport (user scrolled into scrollback).
+        // Nothing to update on the cursor-only path; bail out so we don't write
+        // past the end of newLines and emit a row-too-tall frame.
+        if (curRow < 0 || curRow >= d.rows) return;
         const startY = buf.viewportY;
         const cursorRow = readBufferRow(term, startY + curRow, d.cols, cursorVisible.current, curRow, curCol, curRow, selection.current);
         if (cached[curRow] && spansEqual(cached[curRow], cursorRow)) return;
