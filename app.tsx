@@ -185,13 +185,14 @@ function isCellSelected(row: number, col: number, sel: Selection): boolean {
 }
 
 interface ContextMenuState {
-  kind: 'clipboard' | 'session';
+  kind: 'clipboard' | 'automateLinuxTerminalMenu';
   row: number;
   col: number;
   hasSelection: boolean;
   hoverItem: number;
   claudeSessionId: string | null;
   claudeCwd: string | null;
+  claudeElapsed: string | null;
 }
 
 const EMPTY_SPAN: Span = { text: " ", bold: false, dim: false, italic: false, underline: false, strikethrough: false };
@@ -211,6 +212,7 @@ function spansEqual(a: Span[], b: Span[]): boolean {
 interface ClaudeSessionInfo {
   sessionId: string;
   cwd: string | null;
+  pid: number;
 }
 
 function detectClaudeSession(shellPid: number): ClaudeSessionInfo | null {
@@ -247,7 +249,7 @@ function detectClaudeSession(shellPid: number): ClaudeSessionInfo | null {
               cwd = execFileSync('readlink', [`/proc/${pid}/cwd`], { encoding: 'utf-8', timeout: 500 }).trim();
             } catch {}
           }
-          return { sessionId, cwd };
+          return { sessionId, cwd, pid };
         }
         if (ppid <= 1) break;
         current = ppid;
@@ -255,6 +257,29 @@ function detectClaudeSession(shellPid: number): ClaudeSessionInfo | null {
     }
   }
   return null;
+}
+
+function getProcessElapsed(pid: number): string | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
+    const fields = stat.split(') ')[1]?.split(' ');
+    if (!fields) return null;
+    const startTicks = parseInt(fields[19]);
+    const uptimeStr = readFileSync('/proc/uptime', 'utf-8');
+    const uptimeSecs = parseFloat(uptimeStr.split(' ')[0]);
+    const clkTck = 100;
+    const startSecs = startTicks / clkTck;
+    const elapsedSecs = Math.floor(uptimeSecs - startSecs);
+    if (elapsedSecs < 0) return null;
+    const h = Math.floor(elapsedSecs / 3600);
+    const m = Math.floor((elapsedSecs % 3600) / 60);
+    const s = elapsedSecs % 60;
+    if (h > 0) return `${h}h ${m}m ${s}s`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  } catch {
+    return null;
+  }
 }
 
 function readBufferRow(
@@ -385,7 +410,7 @@ const sessionMenuPad = (s: string) => (s + " ".repeat(SESSION_MENU_INNER)).slice
 const sessionMenuBorder = "─".repeat(SESSION_MENU_INNER);
 
 function ContextMenuOverlay({ menu }: { menu: ContextMenuState }) {
-  if (menu.kind === 'session') {
+  if (menu.kind === 'automateLinuxTerminalMenu') {
     const sessionText = menu.claudeSessionId
       ? `session: ${menu.claudeSessionId.slice(0, 8)}`
       : "no claude session";
@@ -399,14 +424,18 @@ function ContextMenuOverlay({ menu }: { menu: ContextMenuState }) {
           <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
         </Text>
         {menu.claudeSessionId && menu.claudeCwd && (
-          <>
-            <Text backgroundColor="#2d2d2d" color="#888888">{`├${sessionMenuBorder}┤`}</Text>
-            <Text>
-              <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
-              <Text backgroundColor={menu.hoverItem === 1 ? "#3465a4" : "#2d2d2d"} color="#c4a000">{sessionMenuPad(menu.claudeCwd.length > SESSION_MENU_INNER - 2 ? " " + menu.claudeCwd.slice(0, SESSION_MENU_INNER - 4) + "… " : " " + menu.claudeCwd + " ")}</Text>
-              <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
-            </Text>
-          </>
+          <Text>
+            <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
+            <Text backgroundColor={menu.hoverItem === 1 ? "#3465a4" : "#2d2d2d"} color="#c4a000">{sessionMenuPad(menu.claudeCwd.length > SESSION_MENU_INNER - 2 ? " " + menu.claudeCwd.slice(0, SESSION_MENU_INNER - 4) + "… " : " " + menu.claudeCwd + " ")}</Text>
+            <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
+          </Text>
+        )}
+        {menu.claudeElapsed && (
+          <Text>
+            <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
+            <Text backgroundColor="#2d2d2d" color="#73d216">{sessionMenuPad(` elapsed: ${menu.claudeElapsed}`)}</Text>
+            <Text backgroundColor="#2d2d2d" color="#888888">{"│"}</Text>
+          </Text>
         )}
         <Text backgroundColor="#2d2d2d" color="#888888">{`╰${sessionMenuBorder}╯`}</Text>
       </Box>
@@ -596,11 +625,13 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
         const info = detectClaudeSession(shell.pid);
         const claudeSessionId = info?.sessionId ?? null;
         const claudeCwd = info?.cwd ?? null;
-        const menuH = claudeSessionId && claudeCwd ? 5 : 3;
+        const claudeElapsed = info ? getProcessElapsed(info.pid) : null;
+        const extraRows = (claudeSessionId && claudeCwd ? 1 : 0) + (claudeElapsed ? 1 : 0);
+        const menuH = 3 + extraRows;
         const menuW = SESSION_MENU_INNER + 2;
         const r = Math.max(0, Math.min(row, d.rows - menuH));
         const c = Math.max(0, Math.min(col, d.cols - menuW));
-        ctxMenuRef.current = { kind: 'session', row: r, col: c, hasSelection: false, hoverItem: -1, claudeSessionId, claudeCwd };
+        ctxMenuRef.current = { kind: 'automateLinuxTerminalMenu', row: r, col: c, hasSelection: false, hoverItem: -1, claudeSessionId, claudeCwd, claudeElapsed };
       } else {
         const menuH = 4, menuW = 10;
         const r = Math.max(0, Math.min(row, d.rows - menuH));
@@ -609,7 +640,7 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
           const s = normalizeSelection(selection.current!);
           return !(s.startRow === s.endRow && s.startCol === s.endCol);
         })();
-        ctxMenuRef.current = { kind: 'clipboard', row: r, col: c, hasSelection: hasSel, hoverItem: -1, claudeSessionId: null, claudeCwd: null };
+        ctxMenuRef.current = { kind: 'clipboard', row: r, col: c, hasSelection: hasSel, hoverItem: -1, claudeSessionId: null, claudeCwd: null, claudeElapsed: null };
       }
       setCtxMenu({ ...ctxMenuRef.current });
       process.stdout.write('\x1b[?1003h');
@@ -640,8 +671,8 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
               const rowOff = mRow - m.row;
               let itemIdx: number;
               let menuW: number;
-              if (m.kind === 'session') {
-                itemIdx = rowOff === 1 ? 0 : rowOff === 3 ? 1 : -1;
+              if (m.kind === 'automateLinuxTerminalMenu') {
+                itemIdx = rowOff === 1 ? 0 : rowOff === 2 ? 1 : -1;
                 menuW = SESSION_MENU_INNER;
               } else {
                 itemIdx = rowOff === 1 ? 0 : rowOff === 2 ? 1 : -1;
@@ -659,10 +690,10 @@ function TerminalEmulator({ rows, cols }: { rows: number; cols: number }) {
                 if (m.kind === 'clipboard') {
                   if (onItem && itemIdx === 0 && m.hasSelection) copySelectionToClipboard();
                   else if (onItem && itemIdx === 1) pasteFromClipboard();
-                } else if (m.kind === 'session' && onItem && itemIdx === 1 && m.claudeCwd) {
+                } else if (m.kind === 'automateLinuxTerminalMenu' && onItem && itemIdx === 1 && m.claudeCwd) {
                   const clip = spawn("xclip", ["-selection", "clipboard"], { stdio: ["pipe", "ignore", "ignore"] });
                   clip.stdin.end(m.claudeCwd);
-                } else if (m.kind === 'session' && onItem && itemIdx === 0 && m.claudeSessionId) {
+                } else if (m.kind === 'automateLinuxTerminalMenu' && onItem && itemIdx === 0 && m.claudeSessionId) {
                   const clip = spawn("xclip", ["-selection", "clipboard"], { stdio: ["pipe", "ignore", "ignore"] });
                   clip.stdin.end(m.claudeSessionId);
                 }
